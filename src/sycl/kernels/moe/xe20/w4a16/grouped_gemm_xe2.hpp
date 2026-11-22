@@ -97,8 +97,11 @@ CUTE_DEVICE void MoEGEMM(
   // The surface extensions below only keep the addressing intact for row-major
   // slices, whose stride does not carry the row count.
   static_assert(LayoutKindA == 'R' && actual_layout_of_B == 'R', "surface extension needs row-major A and B");
-  static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && (!std::is_same_v<ElementS, uint8_t>);
-  static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && (std::is_same_v<ElementS, uint8_t>);
+  // E2M1 nibbles: MXFP4 (E8M0 byte scales) and NVFP4 (E4M3 scales, 16 values each).
+  static constexpr bool is_fp4_scale =
+      std::is_same_v<ElementS, uint8_t> || std::is_same_v<ElementS, cutlass::float_e4m3_t>;
+  static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && !is_fp4_scale;
+  static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && is_fp4_scale;
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -225,7 +228,11 @@ CUTE_DEVICE void MoEGEMM(
       D_tensor,                         \
       tile_coord,                       \
       mma);
-        if (group_size == 32) {
+        using ScaleElement = std::remove_cv_t<std::remove_pointer_t<decltype(ptr_Scales_curr_batch)>>;
+        if constexpr (std::is_same_v<ScaleElement, cutlass::float_e4m3_t>) {
+          // NVFP4: one E4M3 scale per 16 E2M1 values (two per K32 tile).
+          XE_GEMM_4BITS_CALLER(16)
+        } else if (group_size == 32) {
           XE_GEMM_4BITS_CALLER(32)
         } else if (group_size == 64) {
           XE_GEMM_4BITS_CALLER(64)

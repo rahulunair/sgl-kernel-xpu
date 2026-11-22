@@ -17,6 +17,12 @@ _MOE_BIASED_TOPK_SCORING_MAP = {
 }
 
 
+# moe_grouped_mm_nt_xe20_w4a16 accepts NVFP4 weights: E2M1 nibbles with one
+# float8_e4m3fn scale per 16 values (is_int4=False, group_size=16, BF16
+# activations). Callers apply any per-tensor/outer factor themselves.
+W4A16_NVFP4_SUPPORTED = True
+
+
 def _mxfp4_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     """Decode E8M0 exponent-byte MXFP4 block scales into fp32 direct
     multipliers: value = 2^(byte - 127) (OCP MX spec bias 127; byte 0xFF is

@@ -175,7 +175,10 @@ CUTE_DEVICE void xe_gemm_4bits(
   int x_idx = sg_local_id / channel_num;
 
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
-  scaleStoreType scales[thr_N * channel_num];
+  // Scale groups narrower than the K tile (NVFP4: 16 values per E4M3 scale)
+  // carry one scale per DPAS K block of the tile.
+  static constexpr int kTileGroups = group_size < int(tile_k) ? int(tile_k) / group_size : 1;
+  scaleStoreType scales[thr_N * channel_num * kTileGroups];
   conditional_t<HasZero, TA, uint8_t> zeros[thr_N * channel_num];
 
   // Where each (n, channel) slot gathers its group scales from, i.e. the start of
@@ -222,6 +225,8 @@ CUTE_DEVICE void xe_gemm_4bits(
   // MXFP4 without zero points is dequantized inside the E2M1 -> BF16 reorder,
   // which ends in a multiply anyway; see mxfp4_dequant.hpp. Everything else needs
   // the separate pass over the B fragment further down.
+  // E2M1 is dequantized inside the E2M1 -> BF16 reorder for both MXFP4 (E8M0
+  // scale per 32) and NVFP4 (E4M3 scale per 16, one multiplier pair per K block).
   static constexpr bool kFuseDequant = std::is_same_v<TB, float_e2m1_t> && std::is_same_v<TA, bfloat16_t> && !HasZero;
 
   // The multipliers a reorder chunk needs, from the chunk's first value index:
@@ -230,10 +235,11 @@ CUTE_DEVICE void xe_gemm_4bits(
   // 8-value chunk stays inside one n-block.
   using BFragLayout = decltype(tCrB.layout());
   static constexpr int frag_mode0 = size<0>(tCrB.shape());
-  intel::vector_t<float, 2> mul_pairs[kFuseDequant ? thr_N : 1];
+  intel::vector_t<float, 2> mul_pairs[kFuseDequant ? thr_N * kTileGroups : 1];
   auto mul_of = [&](auto dv) -> intel::vector_t<float, 2> const& {
     constexpr int n = (decltype(dv)::value / frag_mode0) % thr_N;
-    return mul_pairs[n];
+    constexpr int kb = kTileGroups > 1 ? (decltype(dv)::value / (frag_mode0 * thr_N)) % kTileGroups : 0;
+    return mul_pairs[n * kTileGroups + kb];
   };
   if constexpr (kFuseDequant) {
     static_assert(channel_num == 2, "the folded multiply covers exactly two channels");
@@ -245,6 +251,9 @@ CUTE_DEVICE void xe_gemm_4bits(
             (thr_N == 1 || stride<1>(BFragLayout{}) == frag_mode0),
         "the folded dequant needs a channel-innermost B fragment with n above mode 0");
     static_assert(frag_mode0 % 8 == 0, "an 8-value reorder chunk must stay inside one n-block");
+    static_assert(
+        kTileGroups == 1 || (size<2>(BFragLayout{}) == kTileGroups && stride<2>(BFragLayout{}) == frag_mode0 * thr_N),
+        "sub-tile scale groups need the fragment's K blocks outermost, one per scale group");
   }
 
   clear(tCrC);
@@ -360,7 +369,7 @@ CUTE_DEVICE void xe_gemm_4bits(
         for (int c = 0; c < channel_num; ++c) {
           const int slot = n * channel_num + c;
           const ElementS* sp = scale_ptr[slot];
-          scale_ptr[slot] = sp + 1;
+          scale_ptr[slot] = sp + kTileGroups;
           const ElementS* zp = nullptr;
           if constexpr (HasZero) {
             zp = zero_ptr[slot];
@@ -374,6 +383,20 @@ CUTE_DEVICE void xe_gemm_4bits(
             if constexpr (HasZero) {
               zeros[slot] = static_cast<TA>(zp[0]);
             }
+          } else if constexpr (std::is_same_v<TB, float_e2m1_t> && std::is_same_v<ElementS, cutlass::float_e4m3_t>) {
+            // NVFP4: E4M3 block scales; E2M1 x E4M3 products are exact in BF16.
+            // The fused reorder folds the conversion constant (the multiplier of
+            // a unit E8M0 scale) into each block scale, an exact power of two.
+            const float unit = kFuseDequant ? mxfp4_fold_multiplier(127u) : 1.0f;
+            CUTLASS_PRAGMA_UNROLL
+            for (int g = 1; g < kTileGroups; ++g) {
+              const float sg = static_cast<float>(sp[g]) * unit;
+              scales[(n * channel_num + c) * kTileGroups + g] = static_cast<scaleStoreType>(sg);
+              if constexpr (kFuseDequant) {
+                mul_pairs[n * kTileGroups + g][c] = sg;
+              }
+            }
+            scale = static_cast<scaleStoreType>(static_cast<float>(sp[0]) * unit);
           } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
             const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
             if constexpr (kFuseDequant) {
@@ -386,9 +409,9 @@ CUTE_DEVICE void xe_gemm_4bits(
             }
           }
 
-          scales[slot] = scale;
+          scales[slot * kTileGroups] = scale;
           if constexpr (kFuseDequant) {
-            mul_pairs[n][c] = scale;
+            mul_pairs[n * kTileGroups][c] = scale;
           }
         }
       }
@@ -407,25 +430,52 @@ CUTE_DEVICE void xe_gemm_4bits(
       reorder(tBrB, tCrB);
     }
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < thr_N && !kFuseDequant; ++n) {
+    if constexpr (kTileGroups > 1 && !kFuseDequant) {
+      // One scale per DPAS K block: the fragment's K mode walks the tile's
+      // group_size-wide K blocks in order.
+      static_assert(!HasZero, "sub-tile scale groups are NVFP4-only (no zero points)");
+      static_assert(size<2>(tCrB.shape()) == kTileGroups, "fragment K blocks must match the tile's scale groups");
       CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < channel_num; ++c) {
+      for (int n = 0; n < thr_N; ++n) {
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
-          if constexpr (HasZero) {
-            TA value = tCrB(cute::tuple(c, _), n, _)[i] - zeros[n * channel_num + c];
-            if constexpr (std::is_same_v<TA, half_t>) {
-              tCrB(cute::tuple(c, _), n, _)[i] = value * scales[n * channel_num + c];
-            } else {
-              tCrB(cute::tuple(c, _), n, _)[i] = moe_xe20::apply_bf16_or_fp16_scale(value, scales[n * channel_num + c]);
+        for (int c = 0; c < channel_num; ++c) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int kb = 0; kb < kTileGroups; ++kb) {
+            auto frag = tCrB(cute::tuple(c, _), n, kb);
+            const auto s = scales[(n * channel_num + c) * kTileGroups + kb];
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(frag); ++i) {
+              if constexpr (std::is_same_v<TA, half_t>) {
+                frag(i) *= s;
+              } else {
+                frag(i) = moe_xe20::apply_bf16_or_fp16_scale(frag(i), s);
+              }
             }
-          } else {
-            if constexpr (std::is_same_v<TA, half_t>) {
-              tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
+          }
+        }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < thr_N && !kFuseDequant; ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < channel_num; ++c) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
+            if constexpr (HasZero) {
+              TA value = tCrB(cute::tuple(c, _), n, _)[i] - zeros[n * channel_num + c];
+              if constexpr (std::is_same_v<TA, half_t>) {
+                tCrB(cute::tuple(c, _), n, _)[i] = value * scales[(n * channel_num + c) * kTileGroups];
+              } else {
+                tCrB(cute::tuple(c, _), n, _)[i] =
+                    moe_xe20::apply_bf16_or_fp16_scale(value, scales[(n * channel_num + c) * kTileGroups]);
+              }
             } else {
-              tCrB(cute::tuple(c, _), n, _)[i] =
-                  moe_xe20::apply_bf16_or_fp16_scale(tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
+              if constexpr (std::is_same_v<TA, half_t>) {
+                tCrB(cute::tuple(c, _), n, _)[i] *= scales[(n * channel_num + c) * kTileGroups];
+              } else {
+                tCrB(cute::tuple(c, _), n, _)[i] = moe_xe20::apply_bf16_or_fp16_scale(
+                    tCrB(cute::tuple(c, _), n, _)[i], scales[(n * channel_num + c) * kTileGroups]);
+              }
             }
           }
         }
