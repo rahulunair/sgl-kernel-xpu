@@ -1908,6 +1908,8 @@ def test_moe_gemm_mxfp8_w8a16_block_weights(
     [
         ((0, 1, 2, 3, 4, 5, 7, 10), torch.uint8),
         ((4, 4, 4, 4, 4, 4, 4, 4), torch.float8_e8m0fnu),
+        # Over 1,024 rows per expert: the large-M block-scaled dispatch.
+        ((1040, 1030), torch.uint8),
     ],
 )
 def test_moe_grouped_mm_mxfp8_w8a16_heterogeneous_block_scales(

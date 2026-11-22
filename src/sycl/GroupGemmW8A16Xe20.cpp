@@ -72,7 +72,7 @@ using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_16_64_32, SG_1_4_1)
 DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_32_64_32, SG_1_4_1)
 DECLARE_XE20_MOE_W8A16_EXTERN(Tile_64_64_32, SG_2_4_1, false)
-DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
+DECLARE_XE20_MOE_W8A16_EXTERN(Tile_128_128_16, SG_4_2_1, false)
 
 #undef DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS
 #undef DECLARE_XE20_MOE_W8A16_EXTERN
@@ -94,12 +94,13 @@ DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
       scale_mode,                                            \
       static_scheduler)
 
+// Block-scaled (UE8M0 K32) weights stay on 32x64x32 past 128 rows per expert:
+// measured on B70, 128x128x16 ran at ~23 TFLOP/s there vs 47-55 for 32x64x32
+// (N 2304-7168, K 1152-7168).
 #define DISPATCH_MOE_W8A16_BLOCK_TILES()                                           \
   do {                                                                             \
     if (avg_m <= 4) {                                                              \
       LAUNCH_MOE_W8A16(true, Tile_16_64_32, SG_1_4_1);                             \
-    } else if (avg_m >= 1024 || (avg_m > 128 && gemm_k >= 512 && gemm_n >= 512)) { \
-      LAUNCH_MOE_W8A16(true, Tile_128_128_16, SG_4_2_1);                           \
     } else {                                                                       \
       LAUNCH_MOE_W8A16(true, Tile_32_64_32, SG_1_4_1);                             \
     }                                                                              \
