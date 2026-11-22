@@ -1118,7 +1118,6 @@ void mha_fwd(
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
   if (rel_bias_.has_value()) {
-    TORCH_CHECK(!softmax_lse.has_value(), "relative attention does not support softmax LSE");
     const at::Tensor& rel_bias = rel_bias_.value();
     TORCH_CHECK(head_size == 128 && head_size_v == 128, "relative attention requires head_dim=head_dim_v=128");
     TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");

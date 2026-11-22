@@ -3,6 +3,9 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
+# return_softmax_lse is compiled for paged relative-attention prefill (rel_bias).
+REL_BIAS_LSE_SUPPORTED = True
+
 
 def build_bidirectional_block_ids(
     seq_lens: Sequence[int],
@@ -251,10 +254,11 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
-            Supported alongside causal and local (sliding-window) masking. Not supported
-            with sink logits (``sinks``), an fp8 KV cache, or relative attention
-            (``rel_bias``) -- no LSE kernel instantiation exists for those; requesting
-            it there raises a ``RuntimeError``.
+            Supported alongside causal and local (sliding-window) masking, and with
+            relative attention (``rel_bias``) for paged prefill (max_seqlen_q > 1).
+            Not supported with sink logits (``sinks``), an fp8 KV cache, or
+            single-token relative decode -- no LSE kernel instantiation exists for
+            those; requesting it there raises a ``RuntimeError``.
         out [optional]: a preallocated output buffer. When provided, the native
             operator writes into and returns this buffer; otherwise it allocates
             the output tensor.
