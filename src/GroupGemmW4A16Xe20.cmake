@@ -18,8 +18,8 @@ endfunction()
 # layouts and have separate N-tail-skip instantiations, because that bit changes
 # device code. select_w4a16_policy_id() chooses from this table per call.
 # group_size (32/64/128/256) is compiled into every unit as a runtime branch,
-# so it does not multiply the instance count. Total: 7 policies x 2
-# (int4/mxfp4) x 2 (bf16/fp16 activation) = 28 units.
+# so it does not multiply the instance count. Total: 7 policies x (2
+# (int4/mxfp4) x 2 (bf16/fp16 activation) + 1 nvfp4/bf16) = 35 units.
 foreach(policy
         w4a16_launch_policy_m_8_n_64
         w4a16_launch_policy_m_16_n_64
@@ -39,6 +39,8 @@ foreach(policy
         # mxfp4: read the raw E8M0 byte from uint8 or float8_e8m0fnu tensors.
         add_group_gemm_w4a16_xe20_inst(${policy} "uint8_t" "${element_a}" "mxfp4_${act_tag}")
     endforeach()
+    # nvfp4: E4M3 scale per 16 E2M1 values, BF16 activations only.
+    add_group_gemm_w4a16_xe20_inst(${policy} "cutlass::float_e4m3_t" "cutlass::bfloat16_t" "nvfp4_bf16")
 endforeach()
 
 list(APPEND device_cpp_xe20 ${GROUP_GEMM_W4A16_XE20_INST_SRCS})

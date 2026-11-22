@@ -1028,6 +1028,79 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
     )
 
 
+_E2M1_VALUES = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+)
+
+
+def _dequantize_nvfp4(packed, scales):
+    """E2M1 nibbles (low nibble first) times one E4M3 scale per 16 values."""
+    nibbles = torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()
+    return _E2M1_VALUES[nibbles] * scales.float().repeat_interleave(16, -1)
+
+
+@pytest.mark.skipif(not utils.is_xe2_device(), reason="NVFP4 W4A16 is an Xe2 instance")
+@pytest.mark.parametrize("num_tokens_per_expert", [1, 8, 33, 129])
+@pytest.mark.parametrize("gemm_n,gemm_k", [(2304, 2304), (2304, 1152)])
+def test_moe_grouped_mm_nt_xe20_w4a16_nvfp4_op(num_tokens_per_expert, gemm_n, gemm_k):
+    """NVFP4 weights (E2M1 with E4M3 K16 scales) against GEMM on dequantized weights."""
+    from sgl_kernel.moe import W4A16_NVFP4_SUPPORTED
+
+    assert W4A16_NVFP4_SUPPORTED
+    torch.manual_seed(0)
+    num_experts = 8
+    packed = torch.randint(
+        0, 256, (num_experts, gemm_n, gemm_k // 2), dtype=torch.uint8
+    )
+    scales = (torch.randint(1, 8, (num_experts, gemm_n, gemm_k // 16)).float() / 4).to(
+        torch.float8_e4m3fn
+    )
+    weights = _dequantize_nvfp4(packed, scales)
+    total_m = num_experts * num_tokens_per_expert
+    activations = (torch.randn(total_m, gemm_k) * 0.1).to(torch.bfloat16)
+    total_rows = torch.full((num_experts,), num_tokens_per_expert, dtype=torch.int32)
+    reference = torch.cat(
+        [
+            activations[
+                e * num_tokens_per_expert : (e + 1) * num_tokens_per_expert
+            ].float()
+            @ weights[e].T
+            for e in range(num_experts)
+        ]
+    ).to(torch.bfloat16)
+    output = torch.empty((total_m, gemm_n), dtype=torch.bfloat16, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        output,
+        activations.xpu(),
+        packed.xpu(),
+        scales.xpu(),
+        None,  # zeros
+        None,  # bias
+        total_rows.xpu(),
+        num_experts,
+        False,  # is_int4
+        16,  # group_size
+    )
+    torch.testing.assert_close(output.cpu(), reference, rtol=1e-1, atol=1e-2)
+
+
 @pytest.mark.skipif(
     not utils.is_xe3_device(),
     reason="moe_grouped_mm_nt_xe35_mxfp4_w4a16 is only registered on Xe3 (CRI) builds",

@@ -88,7 +88,8 @@ void w4a16_launch(
   DECLARE_W4A16_EXTERN(Policy, cutlass::bfloat16_t, cutlass::bfloat16_t) \
   DECLARE_W4A16_EXTERN(Policy, cutlass::half_t, cutlass::half_t)         \
   DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::bfloat16_t)             \
-  DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::half_t)
+  DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::half_t)                 \
+  DECLARE_W4A16_EXTERN(Policy, cutlass::float_e4m3_t, cutlass::bfloat16_t)
 
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_64)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_16_n_64)
@@ -203,10 +204,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
       packed_weights.scalar_type() == at::ScalarType::Char || packed_weights.scalar_type() == at::ScalarType::Byte,
       "packed_weights must be int8 or uint8");
 
-  TORCH_CHECK(
-      group_size == 32 || group_size == 64 || group_size == 128 || group_size == 256,
-      "group_size must be 32, 64, 128 or 256; got ",
-      group_size);
+  // NVFP4: E2M1 weights with one E4M3 scale per 16 values (non-int4 mode with
+  // float8_e4m3fn scales). The per-tensor/outer factor stays with the caller.
+  const bool is_nvfp4 = !is_int4 && scales.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  if (is_nvfp4) {
+    TORCH_CHECK(group_size == 16, "nvfp4 (float8_e4m3fn scales) requires group_size 16; got ", group_size);
+    TORCH_CHECK(activations.scalar_type() == at::ScalarType::BFloat16, "nvfp4 requires bfloat16 activations");
+    TORCH_CHECK(!zeros.has_value(), "zeros are not supported for nvfp4");
+  } else {
+    TORCH_CHECK(
+        group_size == 32 || group_size == 64 || group_size == 128 || group_size == 256,
+        "group_size must be 32, 64, 128 or 256; got ",
+        group_size);
+  }
   TORCH_CHECK(gemm_k % group_size == 0, "K must be a multiple of group_size");
 
   auto sc_shape = scales.sizes().vec();
@@ -218,8 +228,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     TORCH_CHECK(scales.scalar_type() == activations.scalar_type(), "int4 scales dtype must match activations dtype");
   } else {
     TORCH_CHECK(
-        scales.scalar_type() == at::ScalarType::Byte || scales.scalar_type() == at::ScalarType::Float8_e8m0fnu,
-        "mxfp4 scales must be uint8 or float8_e8m0fnu (E8M0 exponent)");
+        is_nvfp4 || scales.scalar_type() == at::ScalarType::Byte ||
+            scales.scalar_type() == at::ScalarType::Float8_e8m0fnu,
+        "mxfp4 scales must be uint8 or float8_e8m0fnu (E8M0 exponent); nvfp4 scales must be float8_e4m3fn");
   }
 
   TORCH_CHECK(n_experts > 0, "n_experts must be positive");
@@ -313,6 +324,22 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
       }                                                                                       \
+    } else if (is_nvfp4) {                                                                    \
+      moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::float_e4m3_t, cutlass::bfloat16_t>( \
+          queue,                                                                              \
+          activations.data_ptr(),                                                             \
+          packed_weights.data_ptr(),                                                          \
+          scales.data_ptr(),                                                                  \
+          zeros_ptr,                                                                          \
+          bias_ptr,                                                                           \
+          output.data_ptr(),                                                                  \
+          gemm_n,                                                                             \
+          gemm_k,                                                                             \
+          rows_per_expert.data_ptr<int>(),                                                    \
+          total_m,                                                                            \
+          static_cast<int>(n_experts),                                                        \
+          static_cast<int>(group_size),                                                       \
+          atomic_buffer.data_ptr<int>());                                                     \
     } else {                                                                                  \
       if (is_fp16_act) {                                                                      \
         moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::half_t>(                 \
@@ -379,6 +406,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
 
 #ifdef USE_MOE_JIT
   {
+    TORCH_CHECK(!is_nvfp4, "nvfp4 W4A16 is AOT-only; rebuild without USE_MOE_JIT");
     std::string jit_err;
     TORCH_CHECK(
         sgl::moe_jit::w4a16_grouped_gemm_launch(

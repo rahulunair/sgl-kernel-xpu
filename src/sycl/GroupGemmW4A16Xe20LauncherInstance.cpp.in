@@ -146,7 +146,8 @@ void w4a16_launch(
                 atomic_buffer);
     };
 
-    if constexpr (std::is_same_v<ElementS, uint8_t>) {
+    if constexpr (std::is_same_v<ElementS, uint8_t> || std::is_same_v<ElementS, cutlass::float_e4m3_t>) {
+        // MXFP4 and NVFP4 have no zero points.
         launch(std::false_type{});
     } else if (zeros != nullptr) {
         launch(std::true_type{});
