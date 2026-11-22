@@ -2444,7 +2444,7 @@ def test_flash_attn_varlen_output(
 if EXTENDED_KVCACHE_TESTS:
 
     @pytest.mark.parametrize(
-        ("nheads_q,nheads_kv,seqlen_q,seqlen_k,d," "causal,local,dtype_name"),
+        ("nheads_q,nheads_kv,seqlen_q,seqlen_k,d,causal,local,dtype_name"),
         VARLEN_CROSS_MATRIX_CASES,
     )
     def test_flash_attn_varlen_cross_matrix(
@@ -2801,11 +2801,23 @@ def test_flash_attn_with_kvcache_out_buffer():
         (False, [257, 513], [1025, 2049], 512, 8, 2),
     ],
 )
+@pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support relative bias")
 def test_relative_attention(
-    dtype, page_size, causal, seqlens_q, seqlens_k, extent, num_heads, num_heads_k
+    dtype,
+    page_size,
+    causal,
+    seqlens_q,
+    seqlens_k,
+    extent,
+    num_heads,
+    num_heads_k,
+    return_lse,
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    if return_lse and max(seqlens_q) == 1:
+        pytest.skip("relative attention returns LSE only from the paged prefill kernel")
 
     torch.manual_seed(17)
     head_dim = 128
@@ -2862,6 +2874,7 @@ def test_relative_attention(
         q_start += q_len
 
     reference = torch.empty_like(q, device="cpu")
+    reference_lse = torch.empty(sum(seqlens_q), num_heads)
     q_start = 0
     for q_len, k_len, k_seq, v_seq in zip(seqlens_q, seqlens_k, k, v):
         q_seq = q[q_start : q_start + q_len].float()
@@ -2882,6 +2895,7 @@ def test_relative_attention(
         reference[q_start : q_start + q_len] = torch.einsum(
             "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq
         ).to(dtype)
+        reference_lse[q_start : q_start + q_len] = torch.logsumexp(scores, -1).T
         q_start += q_len
 
     cu_seqlens_q = torch.tensor(
@@ -2900,7 +2914,10 @@ def test_relative_attention(
         max_seqlen_k=max(seqlens_k),
         causal=causal,
         rel_bias=table.to(dtype).to(device).unsqueeze(0).repeat(sum(seqlens_q), 1, 1),
+        return_softmax_lse=return_lse,
     )
+    if return_lse:
+        out, lse = out
     torch.xpu.synchronize()
     torch.testing.assert_close(
         out.cpu().float(),
@@ -2908,6 +2925,9 @@ def test_relative_attention(
         rtol=0,
         atol=1e-2 if dtype == torch.bfloat16 else 1e-3,
     )
+    if return_lse:
+        # The kernel writes softmax_lse as [heads, tokens].
+        torch.testing.assert_close(lse.cpu().T, reference_lse, rtol=0, atol=1e-3)
 
 
 @pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support ALiBi slopes")
@@ -2968,6 +2988,7 @@ def test_alibi_attention(
         page += page_count
 
     reference = torch.empty_like(q, device="cpu")
+    reference_lse = torch.empty(sum(seqlens_q), num_heads)
     q_start = 0
     for q_len, k_len, k_seq, v_seq in zip(seqlens_q, seqlens_k, k, v):
         q_seq = q[q_start : q_start + q_len].float()
@@ -2982,6 +3003,7 @@ def test_alibi_attention(
         reference[q_start : q_start + q_len] = torch.einsum(
             "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq
         ).to(dtype)
+        reference_lse[q_start : q_start + q_len] = torch.logsumexp(scores, -1).T
         q_start += q_len
 
     cu_seqlens_q = torch.tensor(

@@ -42,6 +42,50 @@
 
 namespace prefill {
 
+#if @HEAD_DIM@ == 128
+// Relative attention (Inkling rel_bias) or ALiBi on its fixed 256x32 tiles; LSE
+// selects the instantiation that also writes softmax_lse.
+template <bool LSE>
+static void run_relative_paged(const Arguments& params) {
+  TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
+  TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
+  TORCH_CHECK(
+      params.alibi_slopes_ptr != nullptr ||
+          params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
+      "relative attention expects a sheared bias with ",
+      prefill::rel_bias_padded_cols(params.rel_bias_extent),
+      " columns");
+  using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
+  using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
+  using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
+  using RelSubgroupLayoutQK =
+      cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+  SGL_DISPATCH_BOOL2(params.is_local, LocalMask, params.is_causal, Causal, [&] {
+    using Element = @ELEM_TYPE@;
+    // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
+    constexpr bool Softcap = false;
+    FMHAConfig<
+        Causal,
+        LocalMask,
+        false,
+        Softcap,
+        LSE,
+        RelTileShapeQK,
+        RelTileShapePV,
+        RelTileShapeOutput,
+        RelSubgroupLayoutQK,
+        void,
+        true,
+        2,
+        false,
+        Element,
+        Element,
+        Element,
+        Element>::run_paged(params);
+  });
+}
+#endif
+
 template <>
 __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   bool use_sink = (params.softmax_sink_ptr != nullptr);
@@ -62,11 +106,17 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   // (Causal && LocalMask) corner is skipped rather than compiled dead.
   if (params.return_softmax_lse) {
     TORCH_CHECK(!use_sink, "return_softmax_lse is not supported with sink masking");
-    // The relative-attention (rel_bias) kernels are only instantiated with
-    // /*LSE=*/false, and they use their own tile shapes; fall through here would
-    // silently drop the bias, so reject the combination instead.
+#if @HEAD_DIM@ == 128
+    if (params.rel_bias_ptr != nullptr || params.alibi_slopes_ptr != nullptr) {
+      run_relative_paged</*LSE=*/true>(params);
+      return;
+    }
+#endif
+    // The relative-attention kernels use their own tile shapes; falling through
+    // here would silently drop the bias, so reject the combination instead.
     TORCH_CHECK(
-        params.rel_bias_ptr == nullptr, "return_softmax_lse is not supported with relative attention");
+        params.rel_bias_ptr == nullptr && params.alibi_slopes_ptr == nullptr,
+        "return_softmax_lse with relative attention requires head_dim == 128");
     using Element = @ELEM_TYPE@;
     if (params.is_causal) {
       dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
@@ -149,42 +199,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
 #if @HEAD_DIM@ == 128
   if (params.rel_bias_ptr != nullptr || params.alibi_slopes_ptr != nullptr) {
-    TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
-    TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
-    TORCH_CHECK(
-        params.alibi_slopes_ptr != nullptr ||
-            params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
-        "relative attention expects a sheared bias with ",
-        prefill::rel_bias_padded_cols(params.rel_bias_extent),
-        " columns");
-    using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
-    using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
-    using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
-    using RelSubgroupLayoutQK =
-        cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
-    SGL_DISPATCH_BOOL2(params.is_local, LocalMask, params.is_causal, Causal, [&] {
-      using Element = @ELEM_TYPE@;
-      // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
-      constexpr bool Softcap = false;
-      FMHAConfig<
-          Causal,
-          LocalMask,
-          false,
-          Softcap,
-          /*LSE=*/false,
-          RelTileShapeQK,
-          RelTileShapePV,
-          RelTileShapeOutput,
-          RelSubgroupLayoutQK,
-          void,
-          true,
-          2,
-          false,
-          Element,
-          Element,
-          Element,
-          Element>::run_paged(params);
-    });
+    run_relative_paged</*LSE=*/false>(params);
     return;
   }
 #else
