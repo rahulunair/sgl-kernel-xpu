@@ -21,6 +21,10 @@ inline constexpr int decode_padded_cols(int extent, int k_tile) {
   return cutlass::fmha::collective::rel_bias_padded_cols(extent, /*m_drift=*/0, k_tile);
 }
 
+// One work-group per (sequence, head, query row): its lanes copy the row's extent
+// relative logits into their sheared columns; the zero-initialized rest stays 0.
+inline constexpr int kShearGroup = 128;
+
 template <typename Element, int QTile>
 struct ShearBiasKernel {
   const Element* input;
@@ -35,22 +39,23 @@ struct ShearBiasKernel {
   int64_t token_stride;
   int64_t head_stride;
 
-  void operator()(sycl::id<3> index) const {
-    const int b = index[0];
-    const int h = index[1];
-    const int q_idx = index[2] / cols;
-    const int col = index[2] % cols;
+  void operator()(sycl::nd_item<3> item) const {
+    const int b = item.get_group(0);
+    const int h = item.get_group(1);
+    const int q_idx = item.get_group(2);
     const int q_len = cu_q[b + 1] - cu_q[b];
     const int k_len = cache_lengths[b];
     if (q_idx >= q_len || k_len > max_seqlen_k) return;
     const int row_kv = k_len - q_len + q_idx;
     const int row_kv_first = row_kv - q_idx % QTile;
     const int col_origin = cutlass::fmha::collective::rel_bias_col_origin(row_kv_first, extent, k_tile);
-    const int rel = row_kv - (col_origin + col);
-    if (rel < 0 || rel >= extent) return;
-
-    const int q_global = cu_q[b] + q_idx;
-    output[(q_global * heads + h) * cols + col] = input[q_global * token_stride + h * head_stride + rel];
+    const int64_t q_global = cu_q[b] + q_idx;
+    const Element* src = input + q_global * token_stride + h * head_stride;
+    Element* dst = output + (q_global * heads + h) * cols;
+    for (int rel = item.get_local_id(2); rel < extent; rel += kShearGroup) {
+      const int col = row_kv - rel - col_origin;
+      if (col >= 0 && col < cols) dst[col] = src[rel];
+    }
   }
 };
 
@@ -77,7 +82,11 @@ at::Tensor prepare_sheared_bias(
 
   ShearBiasKernel<Element, QTile> kernel{
       input, output, cu_q, cache_lengths, heads, max_seqlen_k, cols, extent, k_tile, token_stride, head_stride};
-  sycl_kernel_submit(sycl::range<3>(batch, heads, max_seqlen_q * cols), queue, kernel);
+  sycl_kernel_submit(
+      sycl::range<3>(batch, heads, static_cast<size_t>(max_seqlen_q) * kShearGroup),
+      sycl::range<3>(1, 1, kShearGroup),
+      queue,
+      kernel);
   return bias;
 }
 
